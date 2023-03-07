@@ -9,4 +9,6 @@ edition = "2021"
 mio = {version="0.8.6",features=["os-poll","net"]}
 tokio-util = {version="0.7.7",features=["full"]}
 bytes = "1.0.0"
-# tokio = {version="1.26.0",features = ["rt","net","macros"]}
+tokio = {version="1.26.0",features = ["rt","net","macros","rt-multi-thread","io-util","sync"]}
+futures = { version = "0.3.0", features = ["thread-pool"]}
+tokio-stream = "0.1.12"

@@ -1,17 +1,45 @@
-use std::{io::{self, Write, Read}, collections::HashMap, path::Path, fs};
+use std::{io::{self, Write, Read}, collections::HashMap, path::Path, fs, error::Error};
 
 use bytes::{BytesMut, Buf};
 use mio::{Poll, Events, net::{UnixListener, UnixStream}, Token, Interest,Registry};
 use mio::event::Event;
-use tokio_util::codec::{Decoder, Framed};
+use tokio_util::codec::{Decoder, Framed, Encoder};
 use std::str::from_utf8;
+use tokio_stream::StreamExt;
+use futures::SinkExt;
+
+#[tokio::main]
+async fn main(){
+    let addr_path = Path::new("/tmp/uds.sock");
+    if addr_path.exists() {
+        fs::remove_file("/tmp/uds.sock");
+    }
+    let listener = tokio::net::UnixListener::bind("/tmp/uds.sock").unwrap();
+    loop {
+        match listener.accept().await {
+            Ok((stream, _addr)) => {
+                println!("new client {:?} !",_addr);
+                let mut transport =  Framed::new(stream,Pong);
+                while let Some(msg) = transport.next().await {
+                    let res = msg.unwrap();
+                    println!("{}",&res);
+                    transport.send(res).await;
+                }
+            }
+            Err(e) => { 
+                /* connection failed */
+            
+            }
+        }
+    } 
+}
 
 
 const SERVER: Token = Token(0);
 // Some data we'll send over the connection.
 const DATA: &[u8] = b"Hello world!\n";
 
-fn main()-> io::Result<()>{
+fn main_low()-> io::Result<()>{
     
     let mut poll = Poll::new()?;
     let mut events = Events::with_capacity(128);
@@ -184,11 +212,49 @@ impl Decoder for Pong {
     type Error = io::Error;
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        if src.len() < 1 {
+            return Ok(None);
+        }
+        let mut buffer = String::new();
+        src.reader().read_to_string(&mut buffer).unwrap();
         println!("len {}",src.len());
-        let s = String::from_utf8(src.to_vec()).unwrap();
-        Ok(Some(s))
+        let arr = src.get(0..src.len());
+        // src.truncate(2);
+        println!("len {}",src.len());
+        // println!("len {}",src.len());
+        
+        // src.advance(1);
+        Ok(Some(buffer))
+        // Ok(None)
         // print!(">:{}",s.to_string());
         // todo!()
     }
 }
 
+impl  Encoder<String> for Pong {
+    type Error= io::Error;
+
+    fn encode(&mut self, item: String, dst: &mut BytesMut) -> Result<(), Self::Error> {
+        use std::fmt::Write;
+        // todo!()
+        write!(
+            BytesWrite(dst),
+            "{}",
+            item
+        ).unwrap();
+        return Ok(());
+        struct BytesWrite<'a>(&'a mut BytesMut);
+
+        impl std::fmt::Write for BytesWrite<'_> {
+            fn write_str(&mut self, s: &str) -> std::fmt::Result {
+                self.0.extend_from_slice(s.as_bytes());
+                Ok(())
+            }
+
+            fn write_fmt(&mut self, args: std::fmt::Arguments<'_>) -> std::fmt::Result {
+                std::fmt::write(self, args)
+            }
+        }
+    }
+    
+}
