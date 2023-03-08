@@ -13,61 +13,51 @@ type Tx = mpsc::UnboundedSender<String>;
 
 type Rx = mpsc::UnboundedReceiver<String>;
 
-struct Peer {
-    /// The TCP socket wrapped with the `Lines` codec, defined below.
-    ///
-    /// This handles sending and receiving data on the socket. When using
-    /// `Lines`, we can work at the line level instead of having to manage the
-    /// raw byte operations.
-    lines: Framed<tokio::net::UnixStream, Pong>,
-
-    /// Receive half of the message channel.
-    ///
-    /// This is used to receive messages from peers. When a message is received
-    /// off of this `Rx`, it will be written to the socket.
-    rx: Rx,
-}
 struct Shared {
-    peers: HashMap<std::net::SocketAddr, Tx>,
+    peers:HashMap<String,Tx>,
+}
+struct Peer {
+    lines:Framed<tokio::net::UnixStream,Pong>,
+    rx:Rx,
 }
 
 impl Shared {
-    /// Create a new, empty, instance of `Shared`.
-    fn new() -> Self {
-        Shared {
-            peers: HashMap::new(),
-        }
+    fn new() ->Self {
+        Shared { peers: HashMap::new() }
     }
 
-    /// Send a `LineCodec` encoded message to every peer, except
-    /// for the sender.
-    async fn broadcast(&mut self, sender: SocketAddr, message: &str) {
-        for peer in self.peers.iter_mut() {
+    async fn broadcast(&mut self,sender:String,message:&String) {
+        for peer in self.peers.iter_mut()  {
             if *peer.0 != sender {
                 let _ = peer.1.send(message.into());
             }
         }
     }
+    async fn send_to(&mut self,to:String,msg:&String) {
+        let mut peer = self.peers.get(&to);
+        
+        let mut peer = peer.unwrap();
+        peer.send(msg.into());
+    }
 }
 
 impl Peer {
-    /// Create a new instance of `Peer`.
     async fn new(
-        state: Arc<Mutex<Shared>>,
-        lines: Framed<tokio::net::UnixStream, Pong>,
+        state:Arc<Mutex<Shared>>,
+        lines:Framed<tokio::net::UnixStream,Pong>,
+        cname:String,
     ) -> io::Result<Peer> {
-        // Get the client socket address
-        let addr:std::net::SocketAddr = lines.get_ref().peer_addr().into_iter() as std::net::SocketAddr;
+        let addr = cname;
+        let (tx,rx) = mpsc::unbounded_channel();
 
-        // Create a channel for this peer
-        let (tx, rx) = mpsc::unbounded_channel();
-
-        // Add an entry for this `Peer` in the shared state map.
         state.lock().await.peers.insert(addr, tx);
-
-        Ok(Peer { lines, rx })
+        Ok(Peer { lines: lines, rx: rx })
     }
 }
+
+
+
+
 #[tokio::main]
 async fn main(){
     // let mut channelMap:HashMap<String,&mut Framed<tokio::net::UnixStream,Pong>> = HashMap::new();
@@ -80,6 +70,8 @@ async fn main(){
     // private final short BYTE_VALUE_NUM = 3;
     // private final short ROUTE_VALUE_NUM = 4;
     // private final short REG_NUM = 5;
+
+    // let mut channelMap = HashMap::new();
     let state = Arc::new(Mutex::new(Shared::new()));
 
     let listener = tokio::net::UnixListener::bind("/tmp/uds.sock").unwrap();
@@ -88,11 +80,13 @@ async fn main(){
         match listener.accept().await {
             Ok((stream, _addr)) => {
                 println!("new client {:?} !",_addr);
-                let state = Arc::clone(&state);
+
 
                 let mut transport =  Framed::new(stream,Pong);
+            
                 
                 while let Some(msg) = transport.next().await {
+                    
                     let res = msg.unwrap();
                     match res.1 {
                         1 =>{
@@ -108,16 +102,18 @@ async fn main(){
                             println!("route {}",res.0);
                         },
                         5=>{
-                            let mut peer = Peer::new(state.clone(), lines).await?;
-                            println!("reg {}",res.0);
-                            
+                            // channelMap.insert(res.0, transport.get_ref());
+                            println!("reg");
+                            let state = Arc::clone(&state);
+                            let mut peer = Peer::new(state.clone(), transport,res.0).await;
+                            peer.unwrap();
                             // channelMap.insert(res.0, );
                         }
                         _ =>{
                             println!("{}",&res.0);
                         }
                     }
-                    transport.send(res.0).await;
+                    transport.send(String::from("value")).await;
                 }
             }
             Err(e) => { 
