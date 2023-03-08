@@ -1,128 +1,39 @@
-use std::{io::{self, Write, Read}, collections::HashMap, path::Path, fs, error::Error, sync::Arc};
+use std::{io::{self, Write, Read}, collections::HashMap, path::Path, fs, error::Error};
 
-use bytes::{BytesMut, Buf};
+use bytes::{BytesMut, Buf, Bytes};
 use mio::{Poll, Events, net::{UnixListener, UnixStream}, Token, Interest,Registry};
 use mio::event::Event;
+use tokio::io::AsyncWriteExt;
 use tokio_util::codec::{Decoder, Framed, Encoder};
 use std::str::from_utf8;
 use tokio_stream::StreamExt;
 use futures::SinkExt;
-use tokio::sync::{mpsc, Mutex};
-use std::net::SocketAddr;
-type Tx = mpsc::UnboundedSender<String>;
 
-type Rx = mpsc::UnboundedReceiver<String>;
-
-struct Peer {
-    /// The TCP socket wrapped with the `Lines` codec, defined below.
-    ///
-    /// This handles sending and receiving data on the socket. When using
-    /// `Lines`, we can work at the line level instead of having to manage the
-    /// raw byte operations.
-    lines: Framed<tokio::net::UnixStream, Pong>,
-
-    /// Receive half of the message channel.
-    ///
-    /// This is used to receive messages from peers. When a message is received
-    /// off of this `Rx`, it will be written to the socket.
-    rx: Rx,
-}
-struct Shared {
-    peers: HashMap<std::net::SocketAddr, Tx>,
-}
-
-impl Shared {
-    /// Create a new, empty, instance of `Shared`.
-    fn new() -> Self {
-        Shared {
-            peers: HashMap::new(),
-        }
-    }
-
-    /// Send a `LineCodec` encoded message to every peer, except
-    /// for the sender.
-    async fn broadcast(&mut self, sender: SocketAddr, message: &str) {
-        for peer in self.peers.iter_mut() {
-            if *peer.0 != sender {
-                let _ = peer.1.send(message.into());
-            }
-        }
-    }
-}
-
-impl Peer {
-    /// Create a new instance of `Peer`.
-    async fn new(
-        state: Arc<Mutex<Shared>>,
-        lines: Framed<tokio::net::UnixStream, Pong>,
-    ) -> io::Result<Peer> {
-        // Get the client socket address
-        let addr:std::net::SocketAddr = lines.get_ref().peer_addr().into_iter() as std::net::SocketAddr;
-
-        // Create a channel for this peer
-        let (tx, rx) = mpsc::unbounded_channel();
-
-        // Add an entry for this `Peer` in the shared state map.
-        state.lock().await.peers.insert(addr, tx);
-
-        Ok(Peer { lines, rx })
-    }
-}
 #[tokio::main]
-async fn main(){
-    // let mut channelMap:HashMap<String,&mut Framed<tokio::net::UnixStream,Pong>> = HashMap::new();
+async fn main_tokio(){
     let addr_path = Path::new("/tmp/uds.sock");
     if addr_path.exists() {
         fs::remove_file("/tmp/uds.sock");
     }
-    // private final short GET_NUM = 1;
-    // private final short COMMAND_NUM = 2;
-    // private final short BYTE_VALUE_NUM = 3;
-    // private final short ROUTE_VALUE_NUM = 4;
-    // private final short REG_NUM = 5;
-    let state = Arc::new(Mutex::new(Shared::new()));
-
     let listener = tokio::net::UnixListener::bind("/tmp/uds.sock").unwrap();
     loop {
-
         match listener.accept().await {
             Ok((stream, _addr)) => {
                 println!("new client {:?} !",_addr);
-                let state = Arc::clone(&state);
-
-                let mut transport =  Framed::new(stream,Pong);
                 
-                while let Some(msg) = transport.next().await {
-                    let res = msg.unwrap();
-                    match res.1 {
-                        1 =>{
-                            println!("get num {}",res.0);
-                        },
-                        2 =>{
-                            println!("command {}",res.0);
-                        },
-                        3=>{
-                            println!("value {}",res.0);
-                        },
-                        4=>{
-                            println!("route {}",res.0);
-                        },
-                        5=>{
-                            let mut peer = Peer::new(state.clone(), lines).await?;
-                            println!("reg {}",res.0);
-                            
-                            // channelMap.insert(res.0, );
-                        }
-                        _ =>{
-                            println!("{}",&res.0);
-                        }
+                let mut transport =  Framed::new(stream,Pong);
+                while let Some(msg) = transport.next().await {   
+                    if msg.is_ok() {
+                        println!("ok");
+                        // stream.write_all(b"done").await;
+                        let res = transport.send(String::from("ok")).await;
+                        println!("{:?}",res);
                     }
-                    transport.send(res.0).await;
                 }
             }
             Err(e) => { 
                 /* connection failed */
-            
+                println!("{:?}",e);
             }
         }
     } 
@@ -240,6 +151,8 @@ fn handle_connection_event(
         let mut connection_closed = false;
         let mut received_data = vec![0; 4096];
         let mut bytes_read = 0;
+        // let the_buf = Bytes::new();
+        // connection.bytes();
         // We can (maybe) read from the connection.
         loop {
             
@@ -300,32 +213,54 @@ fn next(current: &mut Token) -> Token {
 
 struct Pong;
 
+struct EntryMessage {
+    value: Bytes,
+    flag:u16,
+}
+
+
 impl Decoder for Pong {
-    type Item = (String,u16);
+    type Item = EntryMessage;
 
     type Error = io::Error;
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
         if src.len() < 1 {
-            return Ok(None);
+            return Err(io::Error::new(io::ErrorKind::Other, "EOF"));
         }
-        let flag = src.get_u16();
-        let body_len = src.get_u32();
-        let str_buf = src.copy_to_bytes(body_len as usize);
-        src.advance(2);
+        println!("---------len {}",src.len());
+        let flag =  src.get_u16();
 
-        let ss = String::from_utf8_lossy(str_buf.chunk());
+        println!("{}------{}",flag,src.len());
+        let bodyLen = src.get_u32();
+        println!("{}------{}",bodyLen,src.len());
         
+        let dst_buf = src.copy_to_bytes(bodyLen as usize);
         
+        // let body = src.get(0..(bodyLen as usize)).unwrap();
+        println!("string------{}",src.len());
+        // src.get_u16();
+        // src.take(2);
+        src.advance(2);
+        // src.truncate(2);
+        println!("------{}",src.len());
+        // let buffer = String::from_utf8_lossy(dst_buf.chunk());
+        // println!("------{}",src.len());
+
 
         // let mut buffer = String::new();
         // src.reader().read_to_string(&mut buffer).unwrap();
         // println!("len {}",src.len());
         // let arr = src.get(0..src.len());
         // println!("len {}",src.len());
-
-
-        Ok(Some((ss.into_owned(),flag)))
+        // println!("len {}",src.len());
+        
+        // src.advance(1);
+        let ent = EntryMessage{
+            value:dst_buf,
+            flag:flag,
+        };
+        Ok(Some(ent))
         // Ok(None)
         // print!(">:{}",s.to_string());
         // todo!()
@@ -340,7 +275,7 @@ impl  Encoder<String> for Pong {
         // todo!()
         write!(
             BytesWrite(dst),
-            "{}",
+            "---{}---",
             item
         ).unwrap();
         return Ok(());
