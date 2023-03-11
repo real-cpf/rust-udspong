@@ -41,14 +41,12 @@ impl Shared {
     fn new()->Self{
         Shared { peers: HashMap::new() }
     }
-    async fn do_route(&mut self,sender:String,message:&str) {
-        let rx = self.peers.get_mut(&sender).unwrap();
-        let _ = rx.send(message.into());
-        // self.peers.iter_mut().for_each(|peer|{
-        //     if *peer.0 != sender {
-        //         let _ = peer.1.send(message.into());
-        //     }
-        // });
+    async fn broadcast(&mut self,sender:String,message:&str) {
+        self.peers.iter_mut().for_each(|peer|{
+            if *peer.0 != sender {
+                let _ = peer.1.send(message.into());
+            }
+        });
     }
 }
 
@@ -81,7 +79,7 @@ async fn handler(
     {
         let mut state = state.lock().await;
         let msg = format!("{} joined !",addr);
-        state.do_route(addr.clone(), &msg).await;
+        state.broadcast(addr.clone(), &msg).await;
     }
     loop {
         tokio::select! {
@@ -89,15 +87,13 @@ async fn handler(
                 peer.lines.send(msg).await.unwrap();
             }
             result = peer.lines.next() => match result {
-
+                // A message was received from the current user, we should
+                // broadcast this message to the other users.
                 Some(Ok(msg)) => {
                     let mut state = state.lock().await;
-                    let mm:Vec<&str> = msg.split(' ').collect();
                     let msg = format!("{}: {}", addr.clone(), msg);
-                    let addr = mm[0].to_string();
-                    let msg = mm[1].to_string();
 
-                    state.do_route(addr.clone(), &msg).await;
+                    state.broadcast(addr.clone(), &msg).await;
                 }
                 // An error occurred.
                 Some(Err(e)) => {
@@ -111,8 +107,6 @@ async fn handler(
 
     Ok(())
 }
-
-
 
 
 #[tokio::main]
