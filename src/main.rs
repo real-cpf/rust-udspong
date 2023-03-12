@@ -6,39 +6,31 @@ use futures::StreamExt;
 use std::collections::HashMap;
 use std::error::Error;
 use std::io;
-use std::io::Cursor;
+
 use std::path::Path;
 use std::sync::Arc;
-use tokio::io::AsyncReadExt;
-use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 use tokio::{
-    io::BufWriter,
     net::{UnixListener, UnixStream},
 };
 use tokio_util::codec::Decoder;
 use tokio_util::codec::Encoder;
 use tokio_util::codec::Framed;
-use tokio_util::codec::LinesCodec;
 
 struct Shared {
     peers: HashMap<String, Tx>,
+    db: HashMap<String,Bytes>,
 }
 
-/// Shorthand for the transmit half of the message channel.
 type Tx = mpsc::UnboundedSender<String>;
 
-/// Shorthand for the receive half of the message channel.
 type Rx = mpsc::UnboundedReceiver<String>;
-
-struct Peer {
-    lines: Framed<UnixStream, LinesCodec>,
-    rx: Rx,
-}
 
 struct PongPeer {
     lines: Framed<UnixStream, PongCodec>,
     rx: Rx,
+    msg_merge:[Bytes;2],
+    merge_index: usize,
 }
 
 impl PongPeer {
@@ -49,7 +41,8 @@ impl PongPeer {
     ) -> io::Result<PongPeer> {
         let (tx, rx) = mpsc::unbounded_channel();
         state.lock().await.peers.insert(addr, tx);
-        Ok(PongPeer { lines, rx })
+        let merge :[Bytes;2]= [Bytes::new(),Bytes::new()];
+        Ok(PongPeer { lines, rx ,msg_merge:merge,merge_index:0})
     }
 }
 
@@ -57,11 +50,27 @@ impl Shared {
     fn new() -> Self {
         Shared {
             peers: HashMap::new(),
+            db: HashMap::new(),
         }
+    }
+    async fn do_put(&mut self,key:Bytes,value:Bytes) {
+        let k = String::from_utf8(key.to_vec()).unwrap();
+        println!("put key{}",k.clone());
+        self.db.insert(k,value);
+    }
+    async fn do_get(&mut self,key:String)->Option<&Bytes> {
+        self.db.get(&key)
+    }
+    async fn do_boardcast(&mut self,sender:String,message:&str) {
+        
+        self.peers.iter_mut().for_each(|peer|{
+            if *peer.0 != sender {
+                let _ = peer.1.send(message.into());
+            }
+        });
     }
     async fn do_route(&mut self, sender: String, message: &str) {
         let rx = self.peers.get_mut(&sender).unwrap();
-        println!("is cloned{}",rx.is_closed());
         let res = rx.send(message.into());
         match res {
             Err(e) =>{
@@ -72,23 +81,7 @@ impl Shared {
             }
         }
         println!("rx.send:{}",message.clone());
-        // self.peers.iter_mut().for_each(|peer|{
-        //     if *peer.0 != sender {
-        //         let _ = peer.1.send(message.into());
-        //     }
-        // });
-    }
-}
 
-impl Peer {
-    async fn new(
-        state: Arc<Mutex<Shared>>,
-        lines: Framed<UnixStream, LinesCodec>,
-        addr: String,
-    ) -> io::Result<Peer> {
-        let (tx, rx) = mpsc::unbounded_channel();
-        state.lock().await.peers.insert(addr, tx);
-        Ok(Peer { lines, rx })
     }
 }
 
@@ -115,7 +108,12 @@ async fn handle_stream(state: Arc<Mutex<Shared>>, stream: UnixStream) -> Result<
         let msg = format!("{} reg done !", channel_name);
         println!("reg");
         state.do_route(channel_name.clone(), &msg).await;
+        // state.do_put(key, value)
     }
+    
+    // let buff = Bytes::new();
+    // String::from_utf8(buff.chunk().to_vec()).unwrap();
+    // peer.msg_merge[peer.merge_index] = Bytes::new();
     
     loop {
         tokio::select! {
@@ -127,22 +125,45 @@ async fn handle_stream(state: Arc<Mutex<Shared>>, stream: UnixStream) -> Result<
             result = peer.lines.next() => match result {
 
                 Some(Ok(msg)) => {
-                    let mut state = state.lock().await;
+                    
                     match msg.0 {
                         4_u16 => {
+                            let mut state = state.lock().await;
                             let buf = msg.1;
                             for i in 0..buf.len() {
                                 if 32_u8 == *buf.get(i).unwrap() {
                                     let cc = &buf.chunk()[0..i];
                                     let channel_name = String::from_utf8(cc.to_vec()).unwrap();
                                     let mm = buf.chunk()[(i+1)..buf.len()].to_vec();
-                                    println!("{}",mm.len());
+                                    
                                     let msg = format!("{}",String::from_utf8(mm).unwrap());
                                     state.do_route(channel_name.clone(), &msg).await;
                                     break;
                                 }
                             }
-                        },_ =>{
+                        },
+                        3_u16 => {
+                            let buf = msg.1;
+                            peer.msg_merge[peer.merge_index] = buf;
+                            peer.merge_index += 1;
+                            if peer.merge_index == 2 {
+                                let mut state = state.lock().await;
+                                state.do_put(peer.msg_merge[0].clone(), peer.msg_merge[1].clone()).await;
+                                peer.merge_index = 0;
+                                let buf = bytes::Bytes::from("ok");
+                                peer.lines.send(buf).await.unwrap();
+                            }
+                        },
+                        1_u16 => {
+                            let mut state = state.lock().await;
+                            let buf = msg.1;
+                            let key = String::from_utf8(buf.chunk().to_vec()).unwrap();
+                            let vv = state.do_get(key).await.unwrap();
+                            let mut res = Bytes::new();
+                            res.clone_from(vv);
+                            peer.lines.send(res).await.unwrap();
+                        },
+                        _ =>{
                             println!("{}",msg.0);
                         }
                     }
@@ -159,55 +180,10 @@ async fn handle_stream(state: Arc<Mutex<Shared>>, stream: UnixStream) -> Result<
     }
     {
         let mut state = state.lock().await;
-        state.peers.remove(&channel_name);
         let msg = format!("{} unreg",channel_name.clone());
-        state.do_route(channel_name, &msg).await;
-    }
-    println!("disconnect!");
-    Ok(())
-}
+        state.do_route(channel_name.clone(), &msg).await;
+        state.peers.remove(&channel_name);
 
-async fn handler(state: Arc<Mutex<Shared>>, stream: UnixStream) -> Result<(), Box<dyn Error>> {
-    let mut lines = Framed::new(stream, LinesCodec::new());
-
-    // let addr = String::from("");
-    lines.send("enter your name:").await.unwrap();
-    let addr = match lines.next().await {
-        Some(Ok(line)) => line,
-        _ => {
-            // String::from("defalut");
-            return Ok(());
-        }
-    };
-    let mut peer = Peer::new(state.clone(), lines, addr.clone()).await.unwrap();
-    {
-        let mut state = state.lock().await;
-        let msg = format!("{} joined !", addr);
-        state.do_route(addr.clone(), &msg).await;
-    }
-    loop {
-        tokio::select! {
-            Some(msg) = peer.rx.recv() => {
-                peer.lines.send(msg).await.unwrap();
-            }
-            result = peer.lines.next() => match result {
-                Some(Ok(msg)) => {
-                    let mut state = state.lock().await;
-                    let mm:Vec<&str> = msg.split(' ').collect();
-                    let msg = format!("{}: {}", addr.clone(), msg);
-                    let addr = mm[0].to_string();
-                    let msg = mm[1].to_string();
-
-                    state.do_route(addr.clone(), &msg).await;
-                }
-                // An error occurred.
-                Some(Err(e)) => {
-                    println!("{:?}",e)
-                }
-                // The stream has been exhausted.
-                None => break,
-            },
-        }
     }
     println!("disconnect!");
     Ok(())
@@ -307,31 +283,5 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 println!("{:?}", e);
             }
         });
-    }
-}
-
-#[tokio::main]
-async fn main_simaple() {
-    let listener = UnixListener::bind("/tmp/uds.sock").unwrap();
-
-    let mut channel_map: HashMap<String, UnixStream> = HashMap::new();
-    loop {
-        let (mut socket, _) = listener.accept().await.unwrap();
-        tokio::spawn(async move {
-            loop {
-                let mut buf = BytesMut::with_capacity(1024);
-                if 0 == socket.read_buf(&mut buf).await.unwrap() {
-                    break;
-                }
-                let len = buf.len();
-                let arr = buf.to_vec();
-                let s = String::from_utf8(arr).unwrap();
-                let ss: Vec<&str> = s.split(' ').collect();
-
-                println!("key {}", ss[0]);
-                socket.write_all(ss[1].as_bytes()).await;
-            }
-        });
-        println!("done this accept!");
     }
 }
