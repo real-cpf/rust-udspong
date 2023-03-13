@@ -33,6 +33,58 @@ struct PongPeer {
     merge_index: usize,
 }
 
+enum PongMessage {
+    GetMsg(String),
+    RouteMsg((String,Bytes)),
+    DictMsg((String,Bytes)),
+    Command(String),
+    Reg(String),
+    Next,
+    None,
+}
+
+// GET_NUM         = 1
+// COMMAND_NUM     = 2
+// BYTE_VALUE_NUM  = 3
+// ROUTE_VALUE_NUM = 4
+// REG_NUM         = 5
+
+impl PongMessage {
+    fn dict(key:String,value:Bytes) -> Result<PongMessage,PongCodecError> {
+        Ok(PongMessage::DictMsg((key,value)))
+    }
+    fn of(t: u16, src:Bytes) -> Result<PongMessage,PongCodecError> {
+        match t {
+            1_u16 =>{
+                let s = String::from_utf8(src.to_vec()).unwrap();
+                return Ok(PongMessage::GetMsg(s));
+            },
+            2_u16 => {
+                let s = String::from_utf8(src.to_vec()).unwrap();
+                return Ok(PongMessage::Command(s));
+            },
+            4_u16 => {
+                for i in 0..src.len() {
+                    if 32_u8 == *src.get(i).unwrap() {
+                        let cc = &src.chunk()[0..i];
+                        let channel_name = String::from_utf8(cc.to_vec()).unwrap();
+                        let mm = src.chunk()[(i+1)..src.len()].to_vec();
+                        return Ok(PongMessage::RouteMsg((channel_name,Bytes::from(mm))));
+                    }
+                }
+                return Ok(PongMessage::None);
+            },
+            5_u16 =>{
+                let s = String::from_utf8(src.to_vec()).unwrap();
+                return Ok(PongMessage::Reg(s));
+            },
+            _ =>{
+                return Ok(PongMessage::None);
+            }
+        }
+    }
+}
+
 impl PongPeer {
     async fn new(
         state: Arc<Mutex<Shared>>,
@@ -53,10 +105,9 @@ impl Shared {
             db: HashMap::new(),
         }
     }
-    async fn do_put(&mut self,key:Bytes,value:Bytes) {
-        let k = String::from_utf8(key.to_vec()).unwrap();
-        println!("put key{}",k.clone());
-        self.db.insert(k,value);
+    async fn do_put(&mut self,key:String,value:Bytes) {
+        println!("put key{}",key.clone());
+        self.db.insert(key,value);
     }
     async fn do_get(&mut self,key:String)->Option<&Bytes> {
         self.db.get(&key)
@@ -99,7 +150,11 @@ async fn handle_stream(state: Arc<Mutex<Shared>>, stream: UnixStream) -> Result<
             return Ok(());
         }
     };
-    let channel_name = String::from_utf8(entry.1.to_vec()).unwrap();
+    let channel_name = match entry {
+        PongMessage::Reg(ref r) => r.to_string(),
+        _=>String::from("")
+    };
+    // let channel_name = String::from_utf8(entry.1.to_vec()).unwrap();
     let mut peer = PongPeer::new(state.clone(), lines, channel_name.clone())
         .await
         .unwrap();
@@ -123,48 +178,28 @@ async fn handle_stream(state: Arc<Mutex<Shared>>, stream: UnixStream) -> Result<
                 peer.lines.send(buf).await.unwrap();
             }
             result = peer.lines.next() => match result {
-
                 Some(Ok(msg)) => {
-                    
-                    match msg.0 {
-                        4_u16 => {
+                    match msg {
+                        PongMessage::GetMsg(ref g) => {
                             let mut state = state.lock().await;
-                            let buf = msg.1;
-                            for i in 0..buf.len() {
-                                if 32_u8 == *buf.get(i).unwrap() {
-                                    let cc = &buf.chunk()[0..i];
-                                    let channel_name = String::from_utf8(cc.to_vec()).unwrap();
-                                    let mm = buf.chunk()[(i+1)..buf.len()].to_vec();
-                                    
-                                    let msg = format!("{}",String::from_utf8(mm).unwrap());
-                                    state.do_route(channel_name.clone(), &msg).await;
-                                    break;
-                                }
-                            }
-                        },
-                        3_u16 => {
-                            let buf = msg.1;
-                            peer.msg_merge[peer.merge_index] = buf;
-                            peer.merge_index += 1;
-                            if peer.merge_index == 2 {
-                                let mut state = state.lock().await;
-                                state.do_put(peer.msg_merge[0].clone(), peer.msg_merge[1].clone()).await;
-                                peer.merge_index = 0;
-                                let buf = bytes::Bytes::from("ok");
-                                peer.lines.send(buf).await.unwrap();
-                            }
-                        },
-                        1_u16 => {
-                            let mut state = state.lock().await;
-                            let buf = msg.1;
-                            let key = String::from_utf8(buf.chunk().to_vec()).unwrap();
-                            let vv = state.do_get(key).await.unwrap();
+                            let vv = state.do_get(g.to_string()).await.unwrap();
                             let mut res = Bytes::new();
                             res.clone_from(vv);
                             peer.lines.send(res).await.unwrap();
                         },
+                        PongMessage::DictMsg((ref k,ref v)) =>{
+                            let mut state = state.lock().await;
+                            state.do_put(k.to_string(), v.clone()).await;
+                            peer.lines.send(bytes::Bytes::from("ok")).await.unwrap();
+                        },
+                        PongMessage::RouteMsg((ref c,ref v)) => {
+                            let mut state = state.lock().await;
+                            let s = String::from_utf8(v.to_vec()).unwrap();
+                            state.do_route(c.to_string(),&format!("{}",s)).await;
+                            peer.lines.send(bytes::Bytes::from("ok")).await.unwrap();
+                        },
                         _ =>{
-                            println!("{}",msg.0);
+                            println!("none");
                         }
                     }
                 }
@@ -217,7 +252,7 @@ impl std::error::Error for PongCodecError {}
 
 struct PongCodec;
 impl Decoder for PongCodec {
-    type Item = (u16, Bytes);
+    type Item = PongMessage;
 
     type Error = PongCodecError;
 
@@ -230,7 +265,13 @@ impl Decoder for PongCodec {
             let body_len = src.get_u32() as usize;
             let body = src.copy_to_bytes(body_len);
             src.advance(2);
-            Ok(Some((num, body)))
+            if src.has_remaining() && src.get_u16() == 3_u16 {
+                let body_len = src.get_u32() as usize;
+                let body_value = src.copy_to_bytes(body_len);
+                src.advance(2);
+                return Ok(Some(PongMessage::dict(String::from_utf8(body.to_vec()).unwrap(), body_value).unwrap()));
+            }
+            Ok(Some(PongMessage::of(num, body).unwrap()))
         } else {
             Err(PongCodecError::WrongTypeNum)
         }
@@ -264,6 +305,9 @@ fn check_type_num(n: u16) -> bool {
         false
     }
 }
+/*
+write client code
+*/
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
