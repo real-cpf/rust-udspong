@@ -5,6 +5,15 @@ edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[[bin]]
+name = "pong-client"
+path = "src/client.rs"
+
+[[bin]]
+name = "pong-server"
+path = "src/pongserver.rs"
+
+
 [dependencies]
 mio = {version="0.8.6",features=["os-poll","net"]}
 tokio-util = {version="0.7.7",features=["full"]}

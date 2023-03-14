@@ -29,8 +29,6 @@ type Rx = mpsc::UnboundedReceiver<String>;
 struct PongPeer {
     lines: Framed<UnixStream, PongCodec>,
     rx: Rx,
-    msg_merge:[Bytes;2],
-    merge_index: usize,
 }
 
 enum PongMessage {
@@ -94,7 +92,7 @@ impl PongPeer {
         let (tx, rx) = mpsc::unbounded_channel();
         state.lock().await.peers.insert(addr, tx);
         let merge :[Bytes;2]= [Bytes::new(),Bytes::new()];
-        Ok(PongPeer { lines, rx ,msg_merge:merge,merge_index:0})
+        Ok(PongPeer { lines, rx})
     }
 }
 
@@ -142,7 +140,7 @@ impl Shared {
 // ROUTE_VALUE_NUM = 4
 // REG_NUM         = 5
 async fn handle_stream(state: Arc<Mutex<Shared>>, stream: UnixStream) -> Result<(), Box<dyn Error>> {
-    let mut lines = Framed::new(stream, PongCodec);
+    let mut lines = Framed::new(stream, PongCodec::new());
 
     let entry = match lines.next().await {
         Some(Ok(line)) => line,
@@ -250,7 +248,14 @@ impl From<io::Error> for PongCodecError {
 
 impl std::error::Error for PongCodecError {}
 
-struct PongCodec;
+struct PongCodec {
+    last_num:u16,
+}
+impl PongCodec {
+    fn new()->PongCodec {
+        PongCodec { last_num: 0 }
+    }
+}
 impl Decoder for PongCodec {
     type Item = PongMessage;
 
@@ -260,15 +265,23 @@ impl Decoder for PongCodec {
         if !src.has_remaining() {
             return Ok(None);
         }
-        let num = src.get_u16();
+        let num = match self.last_num  {
+            0 => src.get_u16(),
+            _=> self.last_num
+        };
         if check_type_num(num) {
             let body_len = src.get_u32() as usize;
             let body = src.copy_to_bytes(body_len);
             src.advance(2);
-            if src.has_remaining() && src.get_u16() == 3_u16 {
+            if src.has_remaining() {
+                self.last_num = src.get_u16();
+            }
+            // TODO the src.get_u16 will advance 2 ,next will be error shuoud use the decode.num to record last num?
+            if num == 3_u16 && self.last_num == 3_u16 {
                 let body_len = src.get_u32() as usize;
                 let body_value = src.copy_to_bytes(body_len);
                 src.advance(2);
+                self.last_num = 0;
                 return Ok(Some(PongMessage::dict(String::from_utf8(body.to_vec()).unwrap(), body_value).unwrap()));
             }
             Ok(Some(PongMessage::of(num, body).unwrap()))
